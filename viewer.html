@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Bus Stop Distance Evaluator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <!-- Leaflet Draw -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css" />
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    .leaflet-popup-content { font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-geometryutil@0.10.0/src/leaflet.geometryutil.js"></script>
+  <script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+  <script src="https://unpkg.com/@mapbox/polyline"></script>
+  <script src="https://cdn.jsdelivr.net/npm/proj4@2.9.2/dist/proj4.js"></script>
+  <script src="https://unpkg.com/proj4leaflet@1.0.2/src/proj4leaflet.js"></script>
+
+
+
+  <!-- Turf.js -->
+  <script src="https://unpkg.com/@turf/turf/turf.min.js"></script>
+
+  <script>
+    // NAD83 / UTM zone 11N
+    proj4.defs('EPSG:26911', '+proj=utm +zone=11 +datum=NAD83 +units=m +no_defs +type=crs');
+
+    function reprojCoord(x, y, from = 'EPSG:26911', to = 'EPSG:4326') {
+      // input meters (x=easting, y=northing) -> output [lon, lat] in degrees
+      const [lon, lat] = proj4(from, to, [x, y]);
+      return [lon, lat];
+    }
+
+    function reprojGeometry(geom, from = 'EPSG:26911', to = 'EPSG:4326') {
+      const t = geom.type;
+      const c = geom.coordinates;
+
+      if (t === 'Point')            return { type: 'Point', coordinates: reprojCoord(c[0], c[1], from, to) };
+      if (t === 'MultiPoint')       return { type: 'MultiPoint', coordinates: c.map(([x,y]) => reprojCoord(x,y,from,to)) };
+      if (t === 'LineString')       return { type: 'LineString', coordinates: c.map(([x,y]) => reprojCoord(x,y,from,to)) };
+      if (t === 'MultiLineString')  return { type: 'MultiLineString', coordinates: c.map(line => line.map(([x,y]) => reprojCoord(x,y,from,to))) };
+      if (t === 'Polygon')          return { type: 'Polygon', coordinates: c.map(ring => ring.map(([x,y]) => reprojCoord(x,y,from,to))) };
+      if (t === 'MultiPolygon')     return { type: 'MultiPolygon', coordinates: c.map(poly => poly.map(ring => ring.map(([x,y]) => reprojCoord(x,y,from,to)))) };
+
+      // GeometryCollection or unknown
+      return geom;
+    }
+
+    function reprojFeature(feat, from = 'EPSG:26911', to = 'EPSG:4326') {
+      return {
+        type: 'Feature',
+        properties: feat.properties || {},
+        geometry: reprojGeometry(feat.geometry, from, to)
+      };
+    }
+
+    function reprojFeatureCollection(fc, from = 'EPSG:26911', to = 'EPSG:4326') {
+      return {
+        type: 'FeatureCollection',
+        name: fc.name,
+        features: (fc.features || []).map(f => reprojFeature(f, from, to))
+      };
+    }
+
+
+
+    console.log("🟢 viewer.html script is executing");
+    
+    const map = L.map('map').setView([36.1523, -115.1571], 13);
+    let evaluationMode = true;  // true = bus stop evaluation, false = speed profile mode
+    let smallRoadLayer = null;
+    let currentSpeedChart = null;
+
+    const roadStyleConfigs = {
+      motorway:    { color: "red", buffer: 0.0003 },
+      trunk:       { color: "darkred", buffer: 0.00028 },
+      primary:     { color: "orange", buffer: 0.00025 },
+      secondary:   { color: "gold", buffer: 0.0002 },
+      tertiary:    { color: "green", buffer: 0.00015 },
+      residential: { color: "blue", buffer: 0.0001 },
+      service:     { color: "gray", buffer: 0.00008 },
+      living_street: { color: "purple", buffer: 0.00008 },
+      unclassified:  { color: "brown", buffer: 0.00008 },
+      undefined:   { color: "black", buffer: 0.00005 },
+      default:     { color: "black", buffer: 0.00005 }
+    };
+
+    fetch("extracted_features/small-nevada-roads_with_slope.geojson")
+      .then(res => res.json())
+      .then(data => {
+        // ✅ Apply reprojection
+        const reprojected = reprojFeatureCollection(data, 'EPSG:26911', 'EPSG:4326');
+
+        // ✅ Confirm reprojection
+        console.log("🔍 First feature geometry after reprojection:", reprojected.features[0].geometry.coordinates);
+
+        // ✅ Add to map
+        smallRoadLayer = L.geoJSON(reprojected, {
+          style: { color: "black", weight: 1 }
+        }).addTo(map);
+
+        // Optionally fit bounds
+        // map.fitBounds(smallRoadLayer.getBounds());
+      });
+
+    const bounds = [[36.15, -115.10], [36.2, -115.05]];
+    L.rectangle(bounds, {
+      color: "#3388ff",
+      weight: 2,
+      fillOpacity: 0.1
+    }).addTo(map);
+
+    fetch('extracted_features/road_buffers_near_intersections.geojson')
+        .then(res => res.json())
+        .then(data => {
+          L.geoJSON(data, {
+            style: feature => {
+              const side = feature.properties.side;
+              const signal = feature.properties.signal;
+
+              if (side === "intersection" && signal === true) return { color: 'red', weight: 1, fillOpacity: 0.6 };
+              if (side === "intersection" && signal === false) return { color: 'black', weight: 1, fillOpacity: 0.6 };
+              if (side === "left") return { color: 'blue', weight: 1, fillOpacity: 0.6 };
+              if (side === "right") return { color: 'green', weight: 1, fillOpacity: 0.6 };
+              if (side === "center") return { color: 'yellow', weight: 1, fillOpacity: 0.6 };
+              return { color: 'gray', weight: 1, fillOpacity: 0.4 };
+            }
+          }).addTo(map);
+        });
+
+    const drawnItems = new L.FeatureGroup().addTo(map);
+    
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polyline: false,
+        polygon: false,
+        circle: false,
+        marker: false,
+        circlemarker: false,
+        rectangle: {
+          shapeOptions: {
+            color: '#ff7800',
+            weight: 2
+          }
+        }
+      },
+      edit: { featureGroup: drawnItems }
+    });
+    map.addControl(drawControl);
+
+    L.Control.CustomMode = L.Control.extend({
+      onAdd: function () {
+        const btn = L.DomUtil.create('button');
+        btn.innerHTML = '📍 Eval Mode';
+        btn.style.background = 'white';
+        btn.style.padding = '6px';
+        btn.style.cursor = 'pointer';
+        btn.style.margin = '5px';
+        btn.title = "Click to toggle speed profile tool";
+
+        L.DomEvent.on(btn, 'click', function (e) {
+          L.DomEvent.stopPropagation(e);
+          evaluationMode = !evaluationMode;
+          btn.style.background = evaluationMode ? 'white' : 'lightgreen';
+          btn.innerHTML = evaluationMode ? '📍 Eval Mode' : '📈 Speed Profile';
+        });
+
+        return btn;
+      },
+      onRemove: function () {}
+    });
+    L.control.customMode = function (opts) {
+      return new L.Control.CustomMode(opts);
+    }
+    L.control.customMode({ position: 'topright' }).addTo(map);
+
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+      if (e.layerType !== 'rectangle') return;
+      drawnItems.clearLayers(); // clear previous
+      const layer = e.layer;
+      drawnItems.addLayer(layer);
+
+      const bounds = layer.getBounds();
+      const bboxPolygon = turf.bboxPolygon([
+        bounds.getWest(),
+        bounds.getSouth(),
+        bounds.getEast(),
+        bounds.getNorth()
+      ]);
+
+      // Loop through line-based layers (footpaths, ramps, etc.)
+      if (smallRoadLayer) {
+        smallRoadLayer.eachLayer(f => {
+          if (!f.feature || f.feature.geometry.type !== 'LineString') return;
+
+          const roadLine = f.toGeoJSON();
+          const intersects = turf.booleanIntersects(roadLine, bboxPolygon);
+
+          if (intersects) {
+            const props = f.feature.properties || {};
+            const roadType = props.highway || "undefined";
+
+            if (!(roadType in roadStyleConfigs)) {
+              console.warn("⚠️ Unknown road type:", roadType);
+            }
+
+            const config = roadStyleConfigs[roadType] || roadStyleConfigs["default"];
+
+            const buffered = turf.buffer(roadLine, config.buffer, { units: 'degrees' });
+
+            L.geoJSON(buffered, {
+              style: { color: config.color, fillOpacity: 0.3 }
+            }).addTo(map);
+          }
+        });
+      }
+    });
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const layerConfigs = {
+      'Railways': { file: 'extracted_features/railways.geojson', color: 'black' },
+      'Water Bodies': { file: 'extracted_features/water.geojson', color: 'blue' },
+      'Footpaths': { file: 'extracted_features/footpaths.geojson', color: 'gray' },
+      'Freeway Ramps': { file: 'extracted_features/ramps.geojson', color: 'orange' },
+      'Bike Lanes': { file: 'extracted_features/bike_lanes.geojson', color: 'green' },
+      'Bus Stops': { file: 'extracted_features/bus_stops.geojson', color: 'purple' },
+      'Intersections': { file: 'extracted_features/small_intersections.geojson', color: 'purple' },
+      'Traffic Lights': { file: 'extracted_features/small-traffic_lights.geojson', color: 'red' },
+      'All Road': { file: 'extracted_features/small-nevada-roads_with_slope.geojson', color: 'white' },
+      'Buffered Roads': {file: 'extracted_features/road_buffer_mean_speed_by_hour.geojson', color: 'magenta'}
+      //'Buffered Roads': {file: 'extracted_features/buffered-small-nevada-roads.geojson', color: 'magenta'}
+    };
+
+    const overlayLayers = {};
+    const geoFeatures = {}; // Store L.GeoJSON layers by label
+
+    function makeLegendLabel(color, label) {
+      return `<span class="color-box" style="background:${color}; display:inline-block; width:12px; height:12px; margin-right:5px;"></span>${label}`;
+    }
+
+    const loadPromises = [];
+
+    for (const [label, config] of Object.entries(layerConfigs)) {
+      const promise = fetch(config.file)
+        .then(res => res.json())
+        .then(data => {
+            const layer = L.geoJSON(data, {
+            style: () => ({ color: config.color, weight: 1, opacity: 0.9 }),
+            pointToLayer: (feature, latlng) =>
+              L.circleMarker(latlng, { radius: 4, color: config.color, fillOpacity: 0.6 }),
+            interactive: false    // 🚫 no feature popups/clicks
+          });
+
+          if (layer) {
+            overlayLayers[makeLegendLabel(config.color, label)] = layer;
+            geoFeatures[label] = layer;
+          } else {
+            console.warn(`⚠️ Could not create layer for: ${label}`);
+          }
+        });
+
+      loadPromises.push(promise);
+    }
+
+
+    Promise.all(loadPromises).then(() => {
+      L.control.layers(null, overlayLayers, { collapsed: false }).addTo(map);
+      smallRoadLayer = geoFeatures['All Road'];
+      
+      fetch("extracted_features/small-nevada-roads_with_slope.geojson")
+        .then(res => res.json())
+        .then(data => {
+          const reprojected = reprojFeatureCollection(data, 'EPSG:26911', 'EPSG:4326');
+          smallRoadLayer = L.geoJSON(reprojected, {
+            style: { color: "black", weight: 1 }
+          }).addTo(map);
+        });
+      // 🚦 Real-time Nevada 511 Layers
+      let roadConditionsLayer, eventsLayer;
+
+      async function fetchNevada511() {
+        const API_KEY = '879123f6d5544e6095982fc9096e51ae';
+        const [roadRes, eventRes] = await Promise.all([
+          fetch(`http://localhost:5000/nv511/roadconditions`),
+          fetch(`http://localhost:5000/nv511/events`)
+        ]);
+        const roads = await roadRes.json();
+        const events = await eventRes.json();
+        return { roads, events };
+      }
+
+      fetchNevada511().then(({ roads, events }) => {
+        // 🎯 Road Conditions — polyline drawing
+        const polylineLayerList = roads.map(rc => {
+          if (!rc.EncodedPolyline) return null;
+
+          try {
+            const latlngs = L.Polyline.fromEncoded(rc.EncodedPolyline).getLatLngs();
+            return L.polyline(latlngs, {
+              color: 'blue',
+              weight: 3,
+              opacity: 0.7
+            }).bindPopup(`
+              <b>Road Condition:</b> ${rc["Overall Status"]}<br>
+              <b>Location:</b> ${rc.LocationDescription}<br>
+              <b>Roadway:</b> ${rc.RoadwayName}<br>
+              <b>Updated:</b> ${new Date(rc.LastUpdated * 1000).toLocaleString()}
+            `);
+          } catch (e) {
+            console.warn("Failed to decode polyline for road condition:", rc, e);
+            return null;
+          }
+        }).filter(l => l !== null);
+
+        //const roadConditionsLayer = L.layerGroup(polylineLayerList).addTo(map);
+
+        // 🚧 Traffic Events
+        const eventMarkers = events.map(ev =>
+          L.marker([ev.Latitude, ev.Longitude], {
+            icon: L.icon({ iconUrl: getIconForEvent(ev.EventType), iconSize: [25, 25] })
+          }).bindPopup(`
+            <b>Event:</b> ${ev.EventType} (${ev.EventSubType})<br>
+            <b>Road:</b> ${ev.RoadwayName}<br>
+            <b>Description:</b> ${ev.Description}<br>
+            <b>Severity:</b> ${ev.Severity}<br>
+            <b>Last Updated:</b> ${new Date(ev.LastUpdated * 1000).toLocaleString()}
+          `)
+        );
+
+        const eventsLayer = L.layerGroup(eventMarkers).addTo(map);
+
+        // Add both as toggleable layers
+        L.control.layers(null, {
+          'Traffic Events': eventsLayer,
+          'Road Conditions': roadConditionsLayer
+        }).addTo(map);
+      });
+
+      // Utility functions (define elsewhere or here)
+      function polylineToGeoJSON(encoded) {
+        // You must decode polyline to GeoJSON LineString here
+        // Use a library like polyline.decode from npm or hardcode a basic decoder
+      }
+
+      function getIconForEvent(type) {
+        return 'https://maps.gstatic.com/mapfiles/ms2/micons/red-dot.png'; // simple default icon
+      }
+    });
+    
+
+    const isFiniteNum = v => v !== null && v !== undefined && isFinite(Number(v));
+
+    const slopeVal = (props) => {
+      const m = isFiniteNum(props?.max_abs_grade_pct_step) ? Number(props.max_abs_grade_pct_step) : null;
+      if (m !== null) return m;                       // prefer densified max grade
+      const g = isFiniteNum(props?.grade_pct) ? Number(props.grade_pct) : null;
+      return g;                                       // fallback to end-to-end
+    };
+
+    const slopeRule = (pct) => {
+      if (!isFiniteNum(pct)) return "Unknown";
+      const v = Number(pct);
+      return (v <= 5) ? "✅ OK (≤5%)" :
+            (v <= 8) ? "⚠️ Caution (5–8%)" :
+                        "❌ Too steep (>8%)";
+    };
+
+    function forEachSegment(layer, cb) {
+      // Works for LineString and MultiLineString
+      const latlngs = layer.getLatLngs();
+      const lines = Array.isArray(latlngs[0]) ? latlngs : [latlngs];
+      for (const line of lines) {
+        for (let i = 0; i < line.length - 1; i++) cb(line[i], line[i+1]);
+      }
+    }
+
+    // snap to nearest road segment within N meters
+    const MAX_SNAP_METERS = 40;
+    let snapLayer; // (only if you want to visualize the snap—if not, ignore it)
+
+    function getNearestRoadAndProps(clickedLatLng, roadLayer) {
+      if (!roadLayer) return null;
+      let best = null, bestDist = Infinity, bestSnap = null;
+
+      roadLayer.eachLayer(layer => {
+        const feat = layer.feature;
+        if (!feat) return;
+        const geom = feat.geometry;
+        if (!geom || (geom.type !== "LineString" && geom.type !== "MultiLineString")) return;
+
+        const lines = (geom.type === "LineString") ? [geom.coordinates] : geom.coordinates;
+        for (const line of lines) {
+          const coords = line.map(c => L.latLng(c[1], c[0]));
+          for (let i = 0; i < coords.length - 1; i++) {
+            const a = coords[i], b = coords[i+1];
+            const d = L.GeometryUtil.distanceSegment(map, clickedLatLng, a, b);
+            if (d < bestDist) {
+              bestDist = d;
+              const p = L.GeometryUtil.closestOnSegment(map, clickedLatLng, a, b); // snap point
+              bestSnap = p;
+              best = { layer, props: feat.properties || {} };
+            }
+          }
+        }
+      });
+
+      if (!best) return null;
+      return { ...best, dist: bestDist, snapPoint: bestSnap };
+    }
+
+
+
+    function getMinDistance(clickedLatLng, geoLayer) {
+      if (!geoLayer) return Infinity;
+
+      let min = Infinity;
+      geoLayer.eachLayer(layer => {
+        const geom = layer.feature.geometry;
+        let coords = [];
+
+        if (geom.type === "Point") {
+          coords = [L.latLng(geom.coordinates[1], geom.coordinates[0])];
+        } else if (geom.type === "LineString") {
+          coords = geom.coordinates.map(c => L.latLng(c[1], c[0]));
+        } else if (geom.type === "Polygon") {
+          coords = geom.coordinates[0].map(c => L.latLng(c[1], c[0]));
+        }
+
+        if (coords.length === 1) {
+          const dist = clickedLatLng.distanceTo(coords[0]);
+          if (!isNaN(dist)) min = Math.min(min, dist);
+        } else if (coords.length >= 2) {
+          for (let i = 0; i < coords.length - 1; i++) {
+            const dist = L.GeometryUtil.distanceSegment(map, clickedLatLng, coords[i], coords[i + 1]);
+            if (!isNaN(dist)) min = Math.min(min, dist);
+          }
+        }
+      });
+
+      return min;
+    }
+
+    // ---------- helpers used by all three ----------
+    function flattenLatLngs(latlngs) {
+      // Leaflet polylines can be [LatLng] or nested arrays (MultiLineString)
+      const out = [];
+      (function rec(a){
+        if (!a) return;
+        if (Array.isArray(a)) {
+          if (a.length && Array.isArray(a[0])) a.forEach(rec);
+          else out.push(...a);
+        } else {
+          out.push(a);
+        }
+      })(latlngs);
+      return out;
+    }
+
+    function eachRoadSegment(roadLayer, cb) {
+      if (!roadLayer) return;
+      roadLayer.eachLayer(layer => {
+        if (typeof layer.getLatLngs !== 'function') return;
+        const latlngs = flattenLatLngs(layer.getLatLngs());
+        if (latlngs.length < 2) return;
+        for (let i = 0; i < latlngs.length - 1; i++) {
+          cb(layer, latlngs[i], latlngs[i+1]);
+        }
+      });
+    }
+
+    function getNearestRoadSpeed(clickedLatLng, roadLayer) {
+      if (!roadLayer) return null;
+
+      let closestSpeed = null;
+      let minDist = Infinity;
+
+      eachRoadSegment(roadLayer, (layer, a, b) => {
+        const d = L.GeometryUtil.distanceSegment(map, clickedLatLng, a, b);
+        if (d < minDist) {
+          minDist = d;
+          const props = layer.feature?.properties || {};
+          // Keep string as-is if it's like "35 mph"; otherwise normalize number
+          closestSpeed = props.maxspeed ?? props.speed_limit ?? "Unknown";
+        }
+      });
+
+      return closestSpeed;
+    }
+
+
+    console.log("✅ Attaching click event to map");
+
+      // Remove any previously drawn rectangles
+      drawnItems.clearLayers();
+      //alert("Drawing cancelled and rectangles removed.");
+
+    function scoreDistance(label, dist) {
+      if (!isFinite(dist)) return 0;
+
+      // Adjust ranges as needed
+      if (["Railways", "Water Bodies", "Freeway Ramps"].includes(label)) {
+        if (dist < 20) return 1;
+        if (dist < 50) return 4;
+        if (dist < 100) return 6;
+        return 9;
+      }
+
+      if (["Footpaths", "Bike Lanes", "Bus Stops", "Traffic Lights"].includes(label)) {
+        if (dist < 10) return 9;
+        if (dist < 30) return 7;
+        if (dist < 60) return 5;
+        return 2;
+      }
+
+      return 4; // default average
+    }  
+
+    const widthByTypeM = {
+      motorway: 22, trunk: 20, primary: 18, secondary: 16, tertiary: 14,
+      residential: 10, service: 7, living_street: 6, unclassified: 8, default: 9
+    };
+
+    function estimateRoadWidth(clickedLatLng, roadLayer) {
+      if (!roadLayer) return null;
+
+      let nearestType = null;
+      let minDist = Infinity;
+
+      eachRoadSegment(roadLayer, (layer, a, b) => {
+        const d = L.GeometryUtil.distanceSegment(map, clickedLatLng, a, b);
+        if (d < minDist) {
+          minDist = d;
+          const props = layer.feature?.properties || {};
+          nearestType = (props.highway || 'default');
+        }
+      });
+
+      if (!nearestType) return "Unknown";
+      const width = widthByTypeM[nearestType] ?? widthByTypeM.default;
+      return `${width.toFixed(1)} m`;
+    }
+
+
+    function getRoadStopCandidate(clickedLatLng, roadLayer) {
+      if (!roadLayer) return null;
+
+      let best = null;
+      let minDist = Infinity;
+
+      roadLayer.eachLayer(layer => {
+        const geom = layer.feature.geometry;
+        const props = layer.feature.properties || {};
+        if (geom.type !== "LineString") return;
+
+        const coords = geom.coordinates.map(c => L.latLng(c[1], c[0]));
+
+        for (let i = 0; i < coords.length - 1; i++) {
+          const distToClick = L.GeometryUtil.distanceSegment(map, clickedLatLng, coords[i], coords[i + 1]);
+          const segmentLength = coords[i].distanceTo(coords[i + 1]);
+
+          if (distToClick < minDist && segmentLength >= 12) {
+            minDist = distToClick;
+
+            const roadType = props.highway || "default";
+            const config = roadStyleConfigs[roadType] || roadStyleConfigs["default"];
+            const widthEstimate = (config.buffer || 0.00005) * 2 * 111000;
+
+            best = {
+              type: roadType,
+              length: segmentLength,
+              widthEnough: widthEstimate >= 3.5
+            };
+          }
+        }
+      });
+
+      return best;
+    }
+
+    function getWaitingArea(clickedLatLng, labels) {
+      const buffer = turf.buffer(turf.point([clickedLatLng.lng, clickedLatLng.lat]), 5, { units: 'meters' });
+
+      const BUS_LENGTH = 12; // meters
+      let maxWidth = 0;
+
+      for (const label of labels) {
+        const layer = geoFeatures[label];
+        if (!layer) continue;
+
+        layer.eachLayer(f => {
+          const geom = f.feature.geometry;
+          const props = f.feature.properties || {};
+          if (geom.type !== 'LineString') return;
+
+          const feature = f.toGeoJSON();
+          if (!turf.booleanIntersects(feature, buffer)) return;
+
+          let width = parseFloat((props.width || "").replace(/[^\d.]/g, ""));
+          if (isNaN(width)) width = 1.5;
+
+          if (width > maxWidth) {
+            maxWidth = width;
+          }
+        });
+      }
+
+      const area = BUS_LENGTH * maxWidth;
+      return maxWidth > 0 ? `${area.toFixed(1)} m²` : "None";
+    }
+    
+    function isDeadEnd(clickedLatLng, roadLayer) {
+      if (!roadLayer) return null;
+
+      const TOL = 8; // meters
+      let nearest = null, nearestLine = null, minDist = Infinity;
+
+      // Find nearest polyline (store its full, flattened LatLng list)
+      roadLayer.eachLayer(layer => {
+        if (typeof layer.getLatLngs !== 'function') return;
+        const pts = flattenLatLngs(layer.getLatLngs());
+        if (pts.length < 2) return;
+        for (let i = 0; i < pts.length - 1; i++) {
+          const d = L.GeometryUtil.distanceSegment(map, clickedLatLng, pts[i], pts[i+1]);
+          if (d < minDist) {
+            minDist = d;
+            nearest = layer;
+            nearestLine = pts;
+          }
+        }
+      });
+
+      if (!nearest || !nearestLine) return "Unknown";
+
+      const start = nearestLine[0];
+      const end   = nearestLine[nearestLine.length - 1];
+      let startConnected = false, endConnected = false;
+
+      // Compare endpoints to endpoints of all other roads
+      roadLayer.eachLayer(layer => {
+        if (layer === nearest) return;
+        if (typeof layer.getLatLngs !== 'function') return;
+        const pts = flattenLatLngs(layer.getLatLngs());
+        if (pts.length < 2) return;
+
+        const otherStart = pts[0];
+        const otherEnd   = pts[pts.length - 1];
+
+        if (start.distanceTo(otherStart) < TOL || start.distanceTo(otherEnd) < TOL) {
+          startConnected = true;
+        }
+        if (end.distanceTo(otherStart) < TOL || end.distanceTo(otherEnd) < TOL) {
+          endConnected = true;
+        }
+      });
+
+      return (startConnected || endConnected) ? "Connected" : "❌ Dead End";
+    }
+
+    map.on('click', e => {
+      if (evaluationMode) {
+        console.log("📍 Map was clicked at:", e.latlng);
+
+        const clickedLatLng = e.latlng;
+        const lat = clickedLatLng.lat.toFixed(6);
+        const lng = clickedLatLng.lng.toFixed(6);
+
+        let result = `<b>Clicked at:</b><br>${lat}, ${lng}<br><br>`;
+
+        // ⏱ Get nearest road speed
+        const nearestSpeed = getNearestRoadSpeed(clickedLatLng, smallRoadLayer);
+        
+        const roadWidth = estimateRoadWidth(clickedLatLng, smallRoadLayer);
+
+        const stopCandidate = getRoadStopCandidate(clickedLatLng, smallRoadLayer);
+        const waitingArea = getWaitingArea(clickedLatLng, ["Footpaths", "Bike Lanes"]);
+        const deadEndStatus = isDeadEnd(clickedLatLng, smallRoadLayer);
+
+        result += `<b>Nearest Road Speed:</b> ${nearestSpeed || "Unknown"}<br>`;
+        result += `<b>Estimated Road Width:</b> ${roadWidth}<br>`;
+        result += `<b>Estimated Waiting Area:</b> ${waitingArea}<br>`;
+        result += `<b>Dead End Check:</b> ${deadEndStatus}<br>`;
+
+        // 🔺 Slope (from nearest road attributes; prefers max_abs_grade_pct_step)
+        const near = getNearestRoadAndProps(e.latlng, smallRoadLayer);
+
+        if (!near || near.dist > MAX_SNAP_METERS) {
+          result += `<b>Slope (percent):</b> Unknown (no road within ${MAX_SNAP_METERS} m)<br>`;
+        } else {
+          const props = near.props || {};
+          const slopePct = (props.max_abs_grade_pct_step != null && !isNaN(+props.max_abs_grade_pct_step))
+            ? +props.max_abs_grade_pct_step
+            : (props.grade_pct != null && !isNaN(+props.grade_pct))
+              ? +props.grade_pct
+              : null;
+
+          if (slopePct == null) {
+            result += `<b>Slope (percent):</b> Unknown<br>`;
+          } else {
+            const ok = slopePct <= 5; // your requirement: 5% threshold
+            result += `<b>Slope (percent):</b> ${slopePct.toFixed(2)}% — ${ok ? "✅ OK (≤5%)" : "❌ Too steep (>5%)"}<br>`;
+            result += `<small>Snapped ${near.dist.toFixed(1)} m to nearest road</small><br>`;
+          }
+        }
+
+
+        if (stopCandidate) {
+          result += `<b>Bus Stop Area:</b><br>`;
+          result += `Road Type: ${stopCandidate.type}<br>`;
+          result += `Segment Length: ${stopCandidate.length.toFixed(1)} m<br>`;
+          result += `Width Enough: ${stopCandidate.widthEnough ? "✅ Yes" : "❌ No"}<br><br>`;
+        } else {
+          result += `<b>🅿️ Bus Stop Candidate:</b> Not Found<br><br>`;
+        }
+
+        result += `<b>Nearest Distances:</b><br>`;
+
+        
+        const distanceScores = {};
+        for (const [label, layer] of Object.entries(geoFeatures)) {
+
+          if (!layer) continue;
+          const d = getMinDistance(clickedLatLng, layer);
+          const score = scoreDistance(label, d);
+          distanceScores[label] = score;
+          result += `${label}: ${isFinite(d) ? d.toFixed(1) + ' m' : 'No feature found'} (Score: ${score})<br>`;
+
+        }
+
+        const popup = L.popup()
+          .setLatLng(clickedLatLng)
+          .setContent(result + `<br><i>Analyzing Street View...</i>`)
+          .openOn(map);
+
+        const gsvUrl = `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${lat},${lng}`;
+        window.open(
+          gsvUrl,
+          'streetviewWindow',
+          'width=600,height=400,top=100,left=100,toolbar=no,location=no,status=no,menubar=no,scrollbars=yes,resizable=yes'
+        );
+
+        console.log("📡 Sending lat/lon to backend:", lat, lng);
+
+        fetch("http://localhost:5000/evaluate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ lat: parseFloat(lat), lon: parseFloat(lng) })
+        })
+          .then(res => res.json())
+          .then(data => {
+            console.log("✅ GPT response received:", data);
+            const scores = {
+              "Posted Stop with Bus Access": data["Posted Stop with Bus Access Score"],
+              "Obstacles Near Stop": data["Obstacles Near Stop Score"],
+              "Visibility to Other Vehicles": data["Visibility to Other Vehicles Score"],
+              "ADA Accessibility": data["ADA Accessibility Score"],
+              "Crossing Hazards": data["Crossing Hazards Score"],
+              "Obstructions to Visibility for Drivers": data["Obstructions to Visibility for Drivers Score"]
+            };
+
+            
+            const allScores = { ...scores, ...distanceScores };
+            const finalAvg = Object.values(allScores).reduce((a, b) => a + b, 0) / Object.values(allScores).length;
+
+            let finalStatus = "Fair", finalColor = "yellow";
+            if (finalAvg >= 7) { finalStatus = "Safe"; finalColor = "green"; }
+            else if (finalAvg < 4) { finalStatus = "Unsafe"; finalColor = "red"; }
+            
+
+
+
+            const gptHtml = `
+              <br><b>GPT-Vision Bus Stop Evaluation:</b><br>
+              <ul>
+                ${Object.entries(scores).map(([k, v]) => `<li><b>${k}:</b> ${v}/9</li>`).join("")}
+              </ul>
+              <b>Distance-Based Scores:</b>
+              <ul>
+                ${Object.entries(distanceScores).map(([k, v]) => `<li><b>${k}:</b> ${v}/9</li>`).join("")}
+              </ul>
+              <div><b>Final Evaluation:</b> 
+                <span style="color:${finalColor}; font-weight:bold">${finalStatus}</span> 
+                (${finalAvg.toFixed(1)}/9)
+              </div>
+              <canvas id="scoreChart" width="300" height="200" style="margin-top:10px;"></canvas>
+            `;
+            popup.setContent(result + gptHtml);
+
+          map.once('popupopen', () => {
+          const ctx = document.getElementById('scoreChart').getContext('2d');
+          new Chart(ctx, {
+            type: 'bar',
+            data: {
+              labels: Object.keys(allScores),
+              datasets: [{
+                label: 'Score',
+                data: Object.values(allScores),
+                backgroundColor: Object.keys(allScores).map(k =>
+                  scores[k] !== undefined ? 'steelblue' : 'darkorange'
+                )
+              }]
+            },
+            options: {
+              scales: {
+                y: {
+                  beginAtZero: true,
+                  max: 9,
+                  ticks: { stepSize: 1 }
+                }
+              },
+              plugins: {
+                legend: { display: false },
+                title: {
+                  display: true,
+                  text: 'GPT + Distance-Based Evaluation Scores'
+                }
+              }
+            }
+          });
+        });
+          })
+          .catch(err => {
+            console.error("❌ GPT call failed:", err);
+            popup.setContent(result + `<br><i>GPT Evaluation failed: ${err.message}</i>`);
+          }); 
+      } else {
+        // 🔵 New speed chart logic
+        const clickedPoint = turf.point([e.latlng.lng, e.latlng.lat]);
+        const speedLayer = geoFeatures["Buffered Roads"];
+        if (!speedLayer) {
+          alert("⚠️ Buffered Roads layer not yet loaded.");
+          return;
+        }
+        if (!speedLayer) return;
+
+        let found = false;
+        speedLayer.eachLayer(layer => {
+          if (found) return;
+
+          const polygon = layer.feature;
+          if (turf.booleanPointInPolygon(clickedPoint, polygon)) {
+            const speeds = polygon.properties.mean_speed_list;
+            if (!Array.isArray(speeds)) return;
+
+           const popup = L.popup()
+            .setLatLng(e.latlng)
+            .setContent('<canvas id="speedChart" width="320" height="200"></canvas>')
+            .openOn(map);
+
+          // Wait until canvas is visible
+          const interval = setInterval(() => {
+            const canvas = document.getElementById('speedChart');
+            if (!canvas) return;
+
+            clearInterval(interval);  // canvas found — stop checking
+
+            const ctx = canvas.getContext('2d');
+            if (currentSpeedChart) {
+              currentSpeedChart.destroy();
+            }
+
+            currentSpeedChart = new Chart(ctx, {
+              type: 'line',
+              data: {
+                labels: [...Array(14)].map((_, i) => `${7 + i}:00`),
+                datasets: [{
+                  label: 'Bus Speed (km/h)',
+                  data: speeds,
+                  borderColor: 'blue',
+                  borderWidth: 2,
+                  pointRadius: 4,
+                  fill: false,
+                  tension: 0.2
+                }]
+              },
+              options: {
+                responsive: true,
+                scales: {
+                  y: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Speed (km/h)' },
+                    ticks: {
+                      callback: value => value.toFixed(1)
+                    }
+                  },
+                  x: {
+                    title: { display: true, text: 'Hour of Day' }
+                  }
+                },
+                plugins: {
+                  legend: { display: false },
+                  title: {
+                    display: true,
+                    text: 'Bus Speed Profile (7AM–8PM)'
+                  }
+                }
+              }
+            });
+          }, 50);  // Check every 50ms until canvas appears
+
+
+
+
+
+            found = true;
+          }
+        });
+
+        if (!found) {
+          L.popup()
+            .setLatLng(e.latlng)
+            .setContent('❌ No road speed buffer found here.')
+            .openOn(map);
+        }
+      }
+    });
+
+
+    L.Polyline.fromEncoded = function (str) {
+      const latlngs = polyline.decode(str);
+      return L.polyline(latlngs.map(([lat, lng]) => [lat, lng]));
+    };
+  </script>
+</body>
+</html>
