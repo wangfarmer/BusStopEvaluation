@@ -18,7 +18,7 @@ import uuid
 app = Flask(__name__)
 CORS(app)
 
-GOOGLE_API_KEY = "AIzaSyAfjBfariAaIgV7dbtGHjYRijp0wCMk4dg"
+GOOGLE_API_KEY = ""
 client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
 model_name = "qwen/qwen3-vl-30b"
 
