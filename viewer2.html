@@ -231,7 +231,7 @@
       let roadConditionsLayer, eventsLayer;
 
       async function fetchNevada511() {
-        const API_KEY = '879123f6d5544e6095982fc9096e51ae';
+        const API_KEY = '';
         const [roadRes, eventRes] = await Promise.all([
           fetch(`http://localhost:5000/nv511/roadconditions`),
           fetch(`http://localhost:5000/nv511/events`)

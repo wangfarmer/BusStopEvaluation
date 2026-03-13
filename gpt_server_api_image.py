@@ -156,12 +156,12 @@ from flask import jsonify
 
 @app.route("/nv511/roadconditions")
 def nv511_roadconditions():
-    r = requests.get("https://www.nvroads.com/api/v2/get/roadconditions?key=879123f6d5544e6095982fc9096e51ae&format=json")
+    r = requests.get("https://www.nvroads.com/api/v2/get/roadconditions?key=&format=json")
     return jsonify(r.json())
 
 @app.route("/nv511/events")
 def nv511_events():
-    r = requests.get("https://www.nvroads.com/api/v2/get/event?key=879123f6d5544e6095982fc9096e51ae&format=json")
+    r = requests.get("https://www.nvroads.com/api/v2/get/event?key=&format=json")
     return jsonify(r.json())
 
 # === Start Server ===
